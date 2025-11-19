@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+    <database>
+        <host>10.50.113.89</host>
+        <user>conf</user>
+        <password>123</password>
+        <database>Conf</database>
+        <port>3307</port>
+    </database>
+</config>
