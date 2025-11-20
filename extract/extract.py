@@ -120,23 +120,49 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
         log_to_database(connection, conf_id, "error", f"Failed to call hotel API: {hotels_response}")
         return False, []
 
-    hotels = hotels_response.get("data", {}).get("citySearch", {}).get("properties", [])
-    if not hotels:
+    properties = hotels_response.get("data", {}).get("citySearch", {}).get("properties", [])
+    if not properties:
         log_to_database(connection, conf_id, "error", "Hotel API returned empty list")
         return False, []
 
-    for hotel in hotels[:5]:
-        property_id = hotel.get("propertyId") or hotel.get("id")
+    hotel_list = []
+    for p in properties[:5]:  # giới hạn demo
+        property_id = p.get("propertyId")
+        content = p.get("content", {})
+        info = content.get("informationSummary", {})
+        reviews_info = content.get("reviews", {})
+        address_info = info.get("address", {})
+
+        hotel_name = info.get("localeName", "N/A")
+        country = address_info.get("country", {}).get("name", "")
+        city = address_info.get("city", {}).get("name", "")
+        area = address_info.get("area", {}).get("name", "")
+        hotel_score = reviews_info.get("cumulative", {}).get("score", "")
+
+        full_address = ", ".join(filter(None, [area, city, country]))
+
+        hotel_data = {
+            "propertyId": property_id,
+            "name": hotel_name,
+            "address": full_address,
+            "hotel_score": hotel_score
+        }
+
         params_reviews = {"propertyId": property_id, "limit": limit}
         ok_review, review_response = call_rapidapi(api_conf, "/hotels/reviews", params_reviews)
-        if ok_review:
-            hotel["reviews"] = review_response
-            hotel["reviews_extracted_at"] = datetime.now().isoformat()
+        if ok_review and review_response:
+            hotel_data["reviews"] = review_response
+            hotel_data["reviews_extracted_at"] = datetime.now().isoformat()
         else:
-            hotel["reviews"] = {"error": review_response}
-            log_to_database(connection, conf_id, "error", f"Failed to call review API for hotel {property_id}")
+            hotel_data["reviews"] = {}
+            log_to_database(connection, conf_id, "error", f"Failed to get reviews for hotel {property_id}")
 
-    return True, hotels
+        hotel_list.append(hotel_data)
+
+    if not hotel_list:
+        return False, []
+
+    return True, hotel_list
 
 
 def save_to_json(data, conf_id, connection, prefix="review"):
@@ -152,7 +178,7 @@ def save_to_json(data, conf_id, connection, prefix="review"):
     return filename
 
 
-def run_extraction(config_file="config.xml", conf_id=1):
+def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today()):
     config = load_config_from_xml(config_file)
     connection = connect_to_database(config)
 
@@ -163,7 +189,7 @@ def run_extraction(config_file="config.xml", conf_id=1):
         return
 
     # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
-    process_id = check_process_running(connection, conf_id, extract_date=date.today())
+    process_id = check_process_running(connection, conf_id, extract_date)
     if process_id:
         log_to_database(connection, conf_id, "info", f"Job already running/done today, skipping.")
         connection.close()
@@ -205,4 +231,4 @@ def run_extraction(config_file="config.xml", conf_id=1):
 
 
 if __name__ == "__main__":
-    run_extraction("config.xml", conf_id=1)
+    run_extraction("config.xml", conf_id=1, extract_date=date(2025, 11, 15))
