@@ -50,23 +50,25 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
 
 # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
 def check_process_running(connection, conf_id, extract_date):
-    cursor = connection.cursor()
+    cursor = connection.cursor(buffered=True)
     cursor.execute("""
-        SELECT process_id FROM process
-        WHERE conf_id = %s AND DATE(start_time) = %s
+        SELECT 1 FROM process
+        WHERE conf_id = %s AND extract_date = %s
           AND status IN ('running', 'done')
+        LIMIT 1
     """, (conf_id, extract_date))
-    row = cursor.fetchone()
+    exists = cursor.fetchone() is not None
     cursor.close()
-    return row[0] if row else None
+    return exists
 
-# 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
-def start_process(connection, conf_id):
+
+# 3. Insert a new extractProcess row with: conf_id, status = 'running', extract_date
+def start_process(connection, conf_id, extract_date):
     cursor = connection.cursor()
     cursor.execute("""
-        INSERT INTO process (conf_id, start_time, status)
-        VALUES (%s, NOW(), 'running')
-    """, (conf_id,))
+        INSERT INTO process (conf_id, start_time, status, extract_date)
+        VALUES (%s, NOW(), 'running', %s)
+    """, (conf_id, extract_date))
     connection.commit()
     process_id = cursor.lastrowid
     cursor.close()
@@ -189,14 +191,13 @@ def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today(
         return
 
     # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
-    process_id = check_process_running(connection, conf_id, extract_date)
-    if process_id:
-        log_to_database(connection, conf_id, "info", f"Job already running/done today, skipping.")
+    if check_process_running(connection, conf_id, extract_date):
+        log_to_database(connection, conf_id, "info", "Job already running/done today, skipping.")
         connection.close()
         return
 
     # 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
-    process_id = start_process(connection, conf_id)
+    process_id = start_process(connection, conf_id, extract_date)
     log_to_database(connection, conf_id, "running", "Extraction started")
 
     try:
