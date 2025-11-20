@@ -29,7 +29,7 @@ def load_config_from_xml(config_file):
 
 def connect_to_database(config):
     conn = mysql.connector.connect(**config)
-    logger.info("Kết nối DB thành công.")
+    logger.info("Connected to database.")
     return conn
 
 def log_to_database(connection, conf_id, status="info", message="", extract_date=date.today()):
@@ -46,87 +46,98 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
         connection.commit()
         cursor.close()
     except Exception as e:
-        logger.error(f"Lỗi ghi log DB: {e}")
+        logger.error(f"Error writing log DB: {e}")
 
+# 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
+def check_process_running(connection, conf_id, extract_date):
+    cursor = connection.cursor()
+    cursor.execute("""
+        SELECT process_id FROM process
+        WHERE conf_id = %s AND DATE(start_time) = %s
+          AND status IN ('running', 'done')
+    """, (conf_id, extract_date))
+    row = cursor.fetchone()
+    cursor.close()
+    return row[0] if row else None
+
+# 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
+def start_process(connection, conf_id):
+    cursor = connection.cursor()
+    cursor.execute("""
+        INSERT INTO process (conf_id, start_time, status)
+        VALUES (%s, NOW(), 'running')
+    """, (conf_id,))
+    connection.commit()
+    process_id = cursor.lastrowid
+    cursor.close()
+    return process_id
+
+def end_process(connection, process_id, status='done', remarks=None):
+    cursor = connection.cursor()
+    cursor.execute("""
+        UPDATE process
+        SET status = %s,
+            end_time = NOW(),
+            remarks = %s
+        WHERE process_id = %s
+    """, (status, remarks, process_id))
+    connection.commit()
+    cursor.close()
+
+# 1. Load extract config from extractConf inputs: conf_id
 def load_api_config_from_db(connection, conf_id):
     cursor = connection.cursor(dictionary=True)
     cursor.execute("SELECT * FROM extractConf WHERE conf_id = %s", (conf_id,))
     conf = cursor.fetchone()
     cursor.close()
-
     if not conf:
-        logger.error(f"Không tìm thấy config id={conf_id}")
-        log_to_database(connection, conf_id, "error", f"Không tìm thấy config id={conf_id}")
+        log_to_database(connection, conf_id, "error", f"Config id={conf_id} not found")
         return None
-
-    log_to_database(connection, conf_id, "info", f"Đã load config API id={conf['conf_id']}: {conf['api_url']}")
+    log_to_database(connection, conf_id, "info", f"Loaded API config id={conf_id}: {conf['api_url']}")
     return conf
 
-def already_running_or_done(connection, conf_id, extract_date):
-    cursor = connection.cursor()
-    cursor.execute("""
-        SELECT COUNT(*) FROM extractLog
-        WHERE conf_id = %s
-          AND DATE(created_at) = %s
-          AND status IN ('done')
-    """, (conf_id, extract_date))
-    count = cursor.fetchone()[0]
-    cursor.close()
-    return count > 0
-
-def extract_hotels_list(api_conf, conf_id, connection):
-    if not api_conf:
-        log_to_database(connection, conf_id, "warning", "Không có config API để chạy.")
-        return []
-
-    log_to_database(connection, conf_id, "info", "Đang gọi API lấy danh sách khách sạn...")
+def call_rapidapi(api_conf, endpoint, params=None):
+    url = api_conf["api_url"] + endpoint
     headers = {
-        "x-rapidapi-key": api_conf['api_key'],
-        "x-rapidapi-host": api_conf['api_host']
+        "x-rapidapi-key": api_conf["api_key"],
+        "x-rapidapi-host": api_conf["api_host"]
     }
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=20)
+        response.raise_for_status()
+        return True, response.json()
+    except Exception as e:
+        return False, str(e)
+
+# 4. Call Rapid API Agoda to extract hotels with reviews, input: api_conf(api_key, api_host...)
+def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
     checkin = (date.today() + timedelta(days=30)).isoformat()
     checkout = (date.today() + timedelta(days=31)).isoformat()
-    params = {"id": api_conf['city_id'], "checkinDate": checkin, "checkoutDate": checkout}
+    params_hotels = {"id": api_conf["city_id"], "checkinDate": checkin, "checkoutDate": checkout}
 
-    try:
-        response = requests.get(api_conf['api_url'] + '/hotels/search-overnight', headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        hotels = data.get("data", {}).get("citySearch", {}).get("properties", [])
-        return hotels
-    
-    #4a. insert new extractLog row table with status = 'error', message = 'failed to call API'
-    except Exception as e:
-        log_to_database(connection, conf_id, "error", f"failed to call API")
-        return []
+    ok, hotels_response = call_rapidapi(api_conf, "/hotels/search-overnight", params_hotels)
+    if not ok:
+        log_to_database(connection, conf_id, "error", f"Failed to call hotel API: {hotels_response}")
+        return False, []
 
-def extract_hotel_reviews(hotel_list, api_conf, conf_id, connection, limit=50):
-    if not hotel_list:
-        return []
+    hotels = hotels_response.get("data", {}).get("citySearch", {}).get("properties", [])
+    if not hotels:
+        log_to_database(connection, conf_id, "error", "Hotel API returned empty list")
+        return False, []
 
-    log_to_database(connection, conf_id, 'info', 'Bắt đầu lấy review khách sạn')
-    url_reviews = f"https://{api_conf['api_host']}/hotels/reviews"
-    headers = {
-        "x-rapidapi-key": api_conf['api_key'],
-        "x-rapidapi-host": api_conf['api_host']
-    }
-
-    for hotel in hotel_list[:5]:
+    for hotel in hotels[:5]:
         property_id = hotel.get("propertyId") or hotel.get("id")
-        querystring = {"propertyId": property_id, "limit": limit}
-        try:
-            response = requests.get(url_reviews, headers=headers, params=querystring, timeout=15)
-            response.raise_for_status()
-            hotel["reviews"] = response.json()
+        params_reviews = {"propertyId": property_id, "limit": limit}
+        ok_review, review_response = call_rapidapi(api_conf, "/hotels/reviews", params_reviews)
+        if ok_review:
+            hotel["reviews"] = review_response
             hotel["reviews_extracted_at"] = datetime.now().isoformat()
-            log_to_database(connection, conf_id, 'success', f'Đã lấy review cho: {hotel.get("name","N/A")}')
-        except Exception as e:
-            #4a. insert new extractLog row table with status = 'error', message = 'failed to call API'
-            hotel["reviews"] = {"error": str(e)}
-            log_to_database(connection, conf_id, 'error', f'failed to call API')
+        else:
+            hotel["reviews"] = {"error": review_response}
+            log_to_database(connection, conf_id, "error", f"Failed to call review API for hotel {property_id}")
 
-    log_to_database(connection, conf_id, 'info', f'Hoàn tất lấy review cho {len(hotel_list)} khách sạn')
-    return hotel_list
+    return True, hotels
+
 
 def save_to_json(data, conf_id, connection, prefix="review"):
     today_str = datetime.now().strftime("%d-%m-%Y")
@@ -134,48 +145,64 @@ def save_to_json(data, conf_id, connection, prefix="review"):
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"{prefix}_{today_str}.json")
 
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-        log_to_database(connection, conf_id, "success", f"Đã lưu file: {filename}")
-        return filename
-
-    except Exception as e:
-    #6a. insert new extractLog row table with status = 'error', message = 'failed to download'
-        log_to_database(connection, conf_id, "error", "failed to download")
-        return None
+    log_to_database(connection, conf_id, "success", f"Saved file: {filename}")
+    return filename
 
 
-def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today()):
-    #0. Connecting Conf database input: config.xml
+def run_extraction(config_file="config.xml", conf_id=1):
     config = load_config_from_xml(config_file)
     connection = connect_to_database(config)
-    #1.Load extractConf inputs: conf_id, extract_date(default = today)
-    api_conf = load_api_config_from_db(connection, conf_id)
-    # if not api_conf:
-    #     log_to_database(connection, conf_id, "warning", "Không có config API hợp lệ để chạy.")
-    #     return
 
-    #2.1 check extractLog with extract_date
-    if already_running_or_done(connection, conf_id, extract_date):
-        log_to_database(connection, conf_id, "info", f"Config id={conf_id} đã chạy hôm nay, dừng extraction.")
+    # 1. Load extract config from extractConf inputs: conf_id
+    api_conf = load_api_config_from_db(connection, conf_id)
+    if not api_conf:
+        connection.close()
         return
 
-    #3. set status = 'running' in extractLog
-    log_to_database(connection, conf_id, "running", "extracting")
-    
-    #4.Call Rapid API with url
-    #5. Extract all review info based on input date
-    hotels = extract_hotels_list(api_conf, conf_id, connection)
-    hotels_with_reviews = extract_hotel_reviews(hotels, api_conf, conf_id, connection)
+    # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
+    process_id = check_process_running(connection, conf_id, extract_date=date.today())
+    if process_id:
+        log_to_database(connection, conf_id, "info", f"Job already running/done today, skipping.")
+        connection.close()
+        return
 
-    #6. download data into a .json file with name: review_dd/mm/yyyy.json in: D:/Data warehouse/extract/
-    file_name = save_to_json(hotels_with_reviews, conf_id, connection, "reviews")
-    
-    #7. set extractLog  status = 'done', message = 'extract successfully'
-    log_to_database(connection, conf_id, "done", f"extract successfully")
-    connection.close()
+    # 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
+    process_id = start_process(connection, conf_id)
+    log_to_database(connection, conf_id, "running", "Extraction started")
+
+    try:
+        # 4. Call Rapid API Agoda to extract hotels with reviews
+        #    Input: api_conf (api_key, api_host, city_id...)
+        ok, hotels_with_reviews = extract_hotels_reviews(api_conf, conf_id, connection)
+        
+        # 5b. download data into a .json file with name: review_dd/mm/yyyy.json in: D:/Data warehouse/extract/ folder
+        if ok and hotels_with_reviews:
+            
+            file_name = save_to_json(hotels_with_reviews, conf_id, connection, "reviews")
+
+            # 6b1. update extractProcess table with process_id status = 'done'
+            end_process(connection, process_id, status='done', remarks=f"Saved JSON: {file_name}")
+            # 6b2. insert new extractLog row table with status = 'succes', message = 'Extraction successfully completed'
+            log_to_database(connection, conf_id, "success", "Extraction successfully completed")
+        else:
+            # 6a1. update extractProcess table with process_id, status = 'error'
+            end_process(connection, process_id, status='error')
+            # 6a2. insert new extractLog row table with status = 'error', message = 'failed to download'
+            log_to_database(connection, conf_id, "error", "failed to download")
+
+    except Exception as e:
+        # 5a1. update extractProcess table with process_id, status = 'error'
+        end_process(connection, process_id, status='error', remarks=str(e))
+        # 5a2. insert new extractLog row table with status = 'error', message = 'failed to call API'
+        log_to_database(connection, conf_id, "error", "failed to call API")
+
+    finally:
+        connection.close()
+
+
 
 if __name__ == "__main__":
-    run_extraction("config.xml", conf_id=1, extract_date=date.today())
+    run_extraction("config.xml", conf_id=1)
