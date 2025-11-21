@@ -5,7 +5,7 @@ import mysql.connector
 import xml.etree.ElementTree as ET
 import logging
 import os
-
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 def setup_console_logging():
     logging.basicConfig(
         level=logging.INFO,
@@ -40,7 +40,7 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
     try:
         cursor = connection.cursor()
         cursor.execute("""
-            INSERT INTO extractLog (conf_id, status, message, created_at)
+            INSERT INTO logs.extractLog (conf_id, status, message, created_at)
             VALUES (%s, %s, %s, %s)
         """, (conf_id, status, message[:500], extract_date))
         connection.commit()
@@ -111,7 +111,6 @@ def call_rapidapi(api_conf, endpoint, params=None):
     except Exception as e:
         return False, str(e)
 
-# 4. Call Rapid API Agoda to extract hotels with reviews, input: api_conf(api_key, api_host...)
 def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
     checkin = (date.today() + timedelta(days=30)).isoformat()
     checkout = (date.today() + timedelta(days=31)).isoformat()
@@ -122,7 +121,7 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
         log_to_database(connection, conf_id, "error", f"Failed to call hotel API: {hotels_response}")
         return False, []
 
-    properties = hotels_response.get("data", {}).get("citySearch", {}).get("properties", [])
+    properties = hotels_response.get("data", {}).get("citySearch", []).get("properties", [])
     if not properties:
         log_to_database(connection, conf_id, "error", "Hotel API returned empty list")
         return False, []
@@ -169,7 +168,7 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
 
 def save_to_json(data, conf_id, connection, prefix="review"):
     today_str = datetime.now().strftime("%d-%m-%Y")
-    folder = r"D:\Data warehousing\extract"
+    folder = r"D:\Data_warehousing\extract"
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"{prefix}_{today_str}.json")
 
@@ -232,4 +231,4 @@ def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today(
 
 
 if __name__ == "__main__":
-    run_extraction("config.xml", conf_id=1, extract_date=date(2025, 11, 15))
+    run_extraction("config.xml", conf_id=1, extract_date=date.today())
