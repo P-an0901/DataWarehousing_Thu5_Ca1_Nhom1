@@ -1,7 +1,7 @@
 import os
 import json
 import mysql.connector
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # -----------------------------
 # 1. CONNECT DATABASE
@@ -45,7 +45,45 @@ def load_json_data(file_path):
         return json.load(f)
 
 # -----------------------------
-# 4. INSERT vào staging.rawReviews
+# 3.5 INSERT NEW CONFIG cho ngày tiếp theo
+# -----------------------------
+def insert_next_day_config(cursor, base_path="D:/DataWarehousing/extract"):
+    """
+    Tạo config mới cho ngày tiếp theo
+    base_path: đường dẫn thư mục chứa file extract (mặc định: D:/DataWarehousing/extract)
+    """
+    # Tính ngày tiếp theo
+    tomorrow = datetime.now() + timedelta(days=1)
+    date_str = tomorrow.strftime("%d-%m-%Y")
+    date_only = tomorrow.strftime("%Y-%m-%d")
+    
+    # Tạo tên config và đường dẫn file
+    config_name = f"Load_Agoda_{tomorrow.strftime('%Y_%m_%d')}"
+    file_path = f"{base_path}/reviews_{date_str}.json"
+    
+    insert_query = """
+        INSERT INTO conf.loadToStagingConf (
+            config_name, file_path, file_format, created_by,
+            extract_date, status, is_active, target_table, retry_count
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    
+    cursor.execute(insert_query, (
+        config_name,  # config_name
+        file_path,  # file_path
+        'review_dd-mm-yyyy.JSON',  # file_format
+        'admin',  # created_by
+        date_only,  # extract_date (YYYY-MM-DD)
+        'PENDING',  # status
+        True,  # is_active
+        'staging.rawReviews',  # target_table
+        0  # retry_count
+    ))
+    
+    return config_name, file_path, date_only
+
+
 # -----------------------------
 def insert_raw_reviews(cursor, reviews):
     insert_query = """
@@ -117,20 +155,31 @@ def main():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. Lấy config active
+    # 1. Lấy config active với extract_date gần nhất thành công
     cursor.execute("""
-        SELECT config_id, file_path
-        FROM conf.loadToStagingConf
-        WHERE is_active = 1 AND status = 'PENDING'
-        ORDER BY config_id LIMIT 1
+        SELECT c.config_id, c.file_path, c.extract_date
+        FROM conf.loadToStagingConf c
+        WHERE c.is_active = 1 
+            AND c.status = 'PENDING'
+            AND c.extract_date = (
+                SELECT MAX(extract_date)
+                FROM conf.loadToStagingConf
+                WHERE is_active = 1 
+                    AND extract_date IN (
+                        SELECT extract_date
+                        FROM logs.extractLog
+                        WHERE status = 'SUCCESS'
+                    )
+            )
+        ORDER BY c.config_id LIMIT 1
     """)
     row = cursor.fetchone()
 
     if not row:
-        print("Không có config nào cần chạy.")
+        print("Không có config nào cần chạy với extract date gần nhất thành công.")
         return
 
-    config_id, file_path = row
+    config_id, file_path, extract_date = row
     file_name = os.path.basename(file_path)
 
     # 2. Ghi log START
@@ -163,10 +212,15 @@ def main():
 
         print(f"✔ DONE — Đã nạp {total_records} dòng.")
 
+
+        # 8. Tạo config mới cho ngày tiếp theo
+        new_config_name, new_file_path, new_extract_date = insert_next_day_config(cursor)
+        conn.commit()
+
     except Exception as e:
         conn.rollback()
 
-        # 8. Log FAILED
+        # 7.1. Log FAILED
         update_log_end(cursor, log_id, 0, "FAILED", str(e))
         conn.commit()
 
@@ -178,6 +232,10 @@ def main():
         conn.commit()
 
         print("❌ ERROR:", e)
+
+        # 8. Tạo config mới cho ngày tiếp theo
+        new_config_name, new_file_path, new_extract_date = insert_next_day_config(cursor)
+        conn.commit()
 
     finally:
         cursor.close()
