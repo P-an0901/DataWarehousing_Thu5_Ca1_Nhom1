@@ -5,7 +5,7 @@ import mysql.connector
 import xml.etree.ElementTree as ET
 import logging
 import os
-
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 def setup_console_logging():
     logging.basicConfig(
         level=logging.INFO,
@@ -40,7 +40,7 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
     try:
         cursor = connection.cursor()
         cursor.execute("""
-            INSERT INTO extractLog (conf_id, status, message, created_at)
+            INSERT INTO logs.extractLog (conf_id, status, message, created_at)
             VALUES (%s, %s, %s, %s)
         """, (conf_id, status, message[:500], extract_date))
         connection.commit()
@@ -50,23 +50,25 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
 
 # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
 def check_process_running(connection, conf_id, extract_date):
-    cursor = connection.cursor()
+    cursor = connection.cursor(buffered=True)
     cursor.execute("""
-        SELECT process_id FROM process
-        WHERE conf_id = %s AND DATE(start_time) = %s
+        SELECT 1 FROM process
+        WHERE conf_id = %s AND extract_date = %s
           AND status IN ('running', 'done')
+        LIMIT 1
     """, (conf_id, extract_date))
-    row = cursor.fetchone()
+    exists = cursor.fetchone() is not None
     cursor.close()
-    return row[0] if row else None
+    return exists
 
-# 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
-def start_process(connection, conf_id):
+
+# 3. Insert a new extractProcess row with: conf_id, status = 'running', extract_date
+def start_process(connection, conf_id, extract_date):
     cursor = connection.cursor()
     cursor.execute("""
-        INSERT INTO process (conf_id, start_time, status)
-        VALUES (%s, NOW(), 'running')
-    """, (conf_id,))
+        INSERT INTO process (conf_id, start_time, status, extract_date)
+        VALUES (%s, NOW(), 'running', %s)
+    """, (conf_id, extract_date))
     connection.commit()
     process_id = cursor.lastrowid
     cursor.close()
@@ -109,7 +111,6 @@ def call_rapidapi(api_conf, endpoint, params=None):
     except Exception as e:
         return False, str(e)
 
-# 4. Call Rapid API Agoda to extract hotels with reviews, input: api_conf(api_key, api_host...)
 def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
     checkin = (date.today() + timedelta(days=30)).isoformat()
     checkout = (date.today() + timedelta(days=31)).isoformat()
@@ -120,28 +121,54 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
         log_to_database(connection, conf_id, "error", f"Failed to call hotel API: {hotels_response}")
         return False, []
 
-    hotels = hotels_response.get("data", {}).get("citySearch", {}).get("properties", [])
-    if not hotels:
+    properties = hotels_response.get("data", {}).get("citySearch", []).get("properties", [])
+    if not properties:
         log_to_database(connection, conf_id, "error", "Hotel API returned empty list")
         return False, []
 
-    for hotel in hotels[:5]:
-        property_id = hotel.get("propertyId") or hotel.get("id")
+    hotel_list = []
+    for p in properties[:5]:  # giới hạn demo
+        property_id = p.get("propertyId")
+        content = p.get("content", {})
+        info = content.get("informationSummary", {})
+        reviews_info = content.get("reviews", {})
+        address_info = info.get("address", {})
+
+        hotel_name = info.get("localeName", "N/A")
+        country = address_info.get("country", {}).get("name", "")
+        city = address_info.get("city", {}).get("name", "")
+        area = address_info.get("area", {}).get("name", "")
+        hotel_score = reviews_info.get("cumulative", {}).get("score", "")
+
+        full_address = ", ".join(filter(None, [area, city, country]))
+
+        hotel_data = {
+            "propertyId": property_id,
+            "name": hotel_name,
+            "address": full_address,
+            "hotel_score": hotel_score
+        }
+
         params_reviews = {"propertyId": property_id, "limit": limit}
         ok_review, review_response = call_rapidapi(api_conf, "/hotels/reviews", params_reviews)
-        if ok_review:
-            hotel["reviews"] = review_response
-            hotel["reviews_extracted_at"] = datetime.now().isoformat()
+        if ok_review and review_response:
+            hotel_data["reviews"] = review_response
+            hotel_data["reviews_extracted_at"] = datetime.now().isoformat()
         else:
-            hotel["reviews"] = {"error": review_response}
-            log_to_database(connection, conf_id, "error", f"Failed to call review API for hotel {property_id}")
+            hotel_data["reviews"] = {}
+            log_to_database(connection, conf_id, "error", f"Failed to get reviews for hotel {property_id}")
 
-    return True, hotels
+        hotel_list.append(hotel_data)
+
+    if not hotel_list:
+        return False, []
+
+    return True, hotel_list
 
 
 def save_to_json(data, conf_id, connection, prefix="review"):
     today_str = datetime.now().strftime("%d-%m-%Y")
-    folder = r"D:\Data warehousing\extract"
+    folder = r"D:\Data_warehousing\extract"
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"{prefix}_{today_str}.json")
 
@@ -152,7 +179,7 @@ def save_to_json(data, conf_id, connection, prefix="review"):
     return filename
 
 
-def run_extraction(config_file="config.xml", conf_id=1):
+def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today()):
     config = load_config_from_xml(config_file)
     connection = connect_to_database(config)
 
@@ -163,14 +190,13 @@ def run_extraction(config_file="config.xml", conf_id=1):
         return
 
     # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
-    process_id = check_process_running(connection, conf_id, extract_date=date.today())
-    if process_id:
-        log_to_database(connection, conf_id, "info", f"Job already running/done today, skipping.")
+    if check_process_running(connection, conf_id, extract_date):
+        log_to_database(connection, conf_id, "info", "Job already running/done today, skipping.")
         connection.close()
         return
 
     # 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
-    process_id = start_process(connection, conf_id)
+    process_id = start_process(connection, conf_id, extract_date)
     log_to_database(connection, conf_id, "running", "Extraction started")
 
     try:
@@ -205,4 +231,4 @@ def run_extraction(config_file="config.xml", conf_id=1):
 
 
 if __name__ == "__main__":
-    run_extraction("config.xml", conf_id=1)
+    run_extraction("config.xml", conf_id=1, extract_date=date.today())
