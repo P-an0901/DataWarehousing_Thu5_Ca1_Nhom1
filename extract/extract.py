@@ -52,7 +52,7 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
 def check_process_running(connection, conf_id, extract_date):
     cursor = connection.cursor(buffered=True)
     cursor.execute("""
-        SELECT 1 FROM process
+        SELECT 1 FROM extractProcess
         WHERE conf_id = %s AND extract_date = %s
           AND status IN ('running', 'done')
         LIMIT 1
@@ -66,7 +66,7 @@ def check_process_running(connection, conf_id, extract_date):
 def start_process(connection, conf_id, extract_date):
     cursor = connection.cursor()
     cursor.execute("""
-        INSERT INTO process (conf_id, start_time, status, extract_date)
+        INSERT INTO extractProcess (conf_id, start_time, status, extract_date)
         VALUES (%s, NOW(), 'running', %s)
     """, (conf_id, extract_date))
     connection.commit()
@@ -77,7 +77,7 @@ def start_process(connection, conf_id, extract_date):
 def end_process(connection, process_id, status='done', remarks=None):
     cursor = connection.cursor()
     cursor.execute("""
-        UPDATE process
+        UPDATE extractProcess
         SET status = %s,
             end_time = NOW(),
             remarks = %s
@@ -94,8 +94,10 @@ def load_api_config_from_db(connection, conf_id):
     cursor.close()
     if not conf:
         log_to_database(connection, conf_id, "error", f"Config id={conf_id} not found")
+        logger.error("Load api config fail.")
         return None
     log_to_database(connection, conf_id, "info", f"Loaded API config id={conf_id}: {conf['api_url']}")
+    logger.info("Load api config success.")
     return conf
 
 def call_rapidapi(api_conf, endpoint, params=None):
@@ -191,8 +193,9 @@ def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today(
 
     # 2. Check extractProcess with conf_id, extract_date(default = today) and status = done, running
     if check_process_running(connection, conf_id, extract_date):
-        log_to_database(connection, conf_id, "info", "Job already running/done today, skipping.")
+        log_to_database(connection, conf_id, "info", "Extract already running/done today, skipping.")
         connection.close()
+        logger.info("Extract already running/done today, skipping.")
         return
 
     # 3. Insert a new extractProcess row with: conf_id, status = 'running', message = 'Extraction started
@@ -213,17 +216,20 @@ def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today(
             end_process(connection, process_id, status='done', remarks=f"Saved JSON: {file_name}")
             # 6b2. insert new extractLog row table with status = 'succes', message = 'Extraction successfully completed'
             log_to_database(connection, conf_id, "success", "Extraction successfully completed")
+            logger.info("Extract data success.")
         else:
             # 6a1. update extractProcess table with process_id, status = 'error'
             end_process(connection, process_id, status='error')
             # 6a2. insert new extractLog row table with status = 'error', message = 'failed to download'
             log_to_database(connection, conf_id, "error", "failed to download")
+            logger.error("Download data fail.")
 
     except Exception as e:
         # 5a1. update extractProcess table with process_id, status = 'error'
         end_process(connection, process_id, status='error', remarks=str(e))
         # 5a2. insert new extractLog row table with status = 'error', message = 'failed to call API'
         log_to_database(connection, conf_id, "error", "failed to call API")
+        logger.error("Extract data fail.")
 
     finally:
         connection.close()
