@@ -154,51 +154,110 @@ def insert_raw_reviews(cursor, reviews):
 def main():
     conn = get_connection()
     cursor = conn.cursor()
-
-    # 1. Lấy config active với extract_date gần nhất thành công
-    cursor.execute("""
-        SELECT c.config_id, c.file_path, c.extract_date
-        FROM conf.loadToStagingConf c
-        WHERE c.is_active = 1 
-            AND c.status = 'PENDING'
-            AND c.extract_date = (
-                SELECT MAX(extract_date)
-                FROM conf.loadToStagingConf
-                WHERE is_active = 1 
-                    AND extract_date IN (
-                        SELECT extract_date
-                        FROM logs.extractLog
-                        WHERE status = 'SUCCESS'
-                    )
-            )
-        ORDER BY c.config_id LIMIT 1
-    """)
-    row = cursor.fetchone()
-
-    if not row:
-        print("Không có config nào cần chạy với extract date gần nhất thành công.")
-        return
-
-    config_id, file_path, extract_date = row
-    file_name = os.path.basename(file_path)
-
-    # 2. Ghi log START
-    log_id, start_time = insert_log_start(cursor, config_id, file_name)
-    conn.commit()
+    config_id = None
+    log_id = None
 
     try:
-        # 3. Load JSON
-        raw_data = load_json_data(file_path)
+        # ========== STEP 1: Query loadToStagingConf ==========
+        cursor.execute("""
+            SELECT c.config_id, c.file_path, c.extract_date
+            FROM conf.loadToStagingConf c
+            WHERE c.is_active = 1 
+                AND c.status = 'PENDING'
+                AND c.extract_date = (
+                    SELECT MAX(extract_date)
+                    FROM conf.loadToStagingConf
+                    WHERE is_active = 1 
+                        AND extract_date IN (
+                            SELECT extract_date
+                            FROM logs.extractLog
+                            WHERE status = 'SUCCESS'
+                        )
+                )
+            ORDER BY c.config_id LIMIT 1
+        """)
+        row = cursor.fetchone()
 
-        # 4. TRUNCATE bảng rawReviews (theo workflow mới)
+        # ========== STEP 2: Query extractLog ==========
+        if row:
+            config_id, file_path, extract_date = row
+            file_name = os.path.basename(file_path)
+            
+            cursor.execute("""
+                SELECT log_id, status, extract_date
+                FROM logs.extractLog
+                WHERE extract_date = %s AND status = 'SUCCESS'
+                LIMIT 1
+            """, (extract_date,))
+            extract_log_row = cursor.fetchone()
+            
+            if not extract_log_row:
+                print(f"❌ FAILED: No successful extract log found for date {extract_date}")
+                return
+        else:
+            print("❌ FAILED: Không có config nào cần chạy với extract date gần nhất thành công.")
+            return
+
+        # ========== STEP 3: Check record ==========
+        # Validate extract log exists
+        if not extract_log_row:
+            print(f"❌ FAILED: Extract log record not found for {extract_date}")
+            # 3a1: Update config status to 'error'
+            cursor.execute("""
+                UPDATE conf.loadToStagingConf
+                SET status = 'FAILED', updated_at = NOW()
+                WHERE config_id = %s
+            """, (config_id,))
+            conn.commit()
+            
+            # 3a2: Add error log
+            error_msg = f"No extract log found for {extract_date}"
+            cursor.execute("""
+                INSERT INTO logs.loadToStagingLog (config_id, status, message, file_processed, created_at)
+                VALUES (%s, %s, %s, %s, CURDATE())
+            """, (config_id, 'FAILED', error_msg, file_name))
+            conn.commit()
+            return
+
+        # ========== STEP 5: Check file ==========
+        if not os.path.exists(file_path):
+            print(f"❌ FAILED: File not found: {file_path}")
+            # 5a1: Update config status to 'error'
+            cursor.execute("""
+                UPDATE conf.loadToStagingConf
+                SET status = 'FAILED', updated_at = NOW()
+                WHERE config_id = %s
+            """, (config_id,))
+            conn.commit()
+            
+            # 5a2: Add error log
+            error_msg = f"Failed to load file {file_name}"
+            cursor.execute("""
+                INSERT INTO logs.loadToStagingLog (config_id, status, message, file_processed, created_at)
+                VALUES (%s, %s, %s, %s, CURDATE())
+            """, (config_id, 'FAILED', error_msg, file_name))
+            conn.commit()
+            return
+
+        # ========== STEP 7: Add row to loadToStagingLog with status='loading' ==========
+        log_id, start_time = insert_log_start(cursor, config_id, file_name)
+        conn.commit()
+
+        # ========== STEP 8: Load JSON and insert to rawReviews ==========
+        print(f"📂 Loading file: {file_path}")
+        raw_data = load_json_data(file_path)
+        
+        # Truncate table
         cursor.execute("TRUNCATE TABLE staging.rawReviews")
         conn.commit()
-
-        # 5. Insert dữ liệu
+        
+        # Insert data
         total_records = insert_raw_reviews(cursor, raw_data)
         conn.commit()
+        
+        print(f"✅ Loaded {total_records} reviews")
 
-        # 6. Update trạng thái CONF
+        # ========== STEP 9: Update config status to 'done' ==========
         cursor.execute("""
             UPDATE conf.loadToStagingConf
             SET status = 'DONE', updated_at = NOW()
@@ -206,36 +265,60 @@ def main():
         """, (config_id,))
         conn.commit()
 
-        # 7. Ghi log SUCCESS
-        update_log_end(cursor, log_id, total_records, "SUCCESS", "Load thành công.")
+        # ========== STEP 10: Add row to loadToStagingLog with status='success' ==========
+        update_log_end(cursor, log_id, total_records, "SUCCESS", "Load to staging complete")
         conn.commit()
 
         print(f"✔ DONE — Đã nạp {total_records} dòng.")
 
-
-        # 8. Tạo config mới cho ngày tiếp theo
+        # ========== Create next day config ==========
         new_config_name, new_file_path, new_extract_date = insert_next_day_config(cursor)
         conn.commit()
+        print(f"📅 Created config for next day: {new_config_name}")
+
+    except FileNotFoundError as e:
+        print(f"❌ ERROR: File not found - {e}")
+        if config_id and log_id:
+            conn.rollback()
+            # 8b1: Update config status to 'error'
+            cursor.execute("""
+                UPDATE conf.loadToStagingConf
+                SET status = 'FAILED', updated_at = NOW()
+                WHERE config_id = %s
+            """, (config_id,))
+            conn.commit()
+            # 8b2: Add error log
+            update_log_end(cursor, log_id, 0, "FAILED", f"Failed to load file: {str(e)}")
+            conn.commit()
+            # Create next day config anyway
+            try:
+                new_config_name, new_file_path, new_extract_date = insert_next_day_config(cursor)
+                conn.commit()
+            except:
+                pass
 
     except Exception as e:
-        conn.rollback()
-
-        # 7.1. Log FAILED
-        update_log_end(cursor, log_id, 0, "FAILED", str(e))
-        conn.commit()
-
-        cursor.execute("""
-            UPDATE conf.loadToStagingConf
-            SET status = 'FAILED', updated_at = NOW()
-            WHERE config_id = %s
-        """, (config_id,))
-        conn.commit()
-
-        print("❌ ERROR:", e)
-
-        # 8. Tạo config mới cho ngày tiếp theo
-        new_config_name, new_file_path, new_extract_date = insert_next_day_config(cursor)
-        conn.commit()
+        print(f"❌ ERROR: {str(e)}")
+        if config_id:
+            conn.rollback()
+            if log_id:
+                # 8b1: Update config status to 'error'
+                cursor.execute("""
+                    UPDATE conf.loadToStagingConf
+                    SET status = 'FAILED', updated_at = NOW()
+                    WHERE config_id = %s
+                """, (config_id,))
+                conn.commit()
+                # 8b2: Add error log
+                update_log_end(cursor, log_id, 0, "FAILED", f"Failed to load to rawReviews table: {str(e)}")
+                conn.commit()
+            
+            # Create next day config anyway
+            try:
+                new_config_name, new_file_path, new_extract_date = insert_next_day_config(cursor)
+                conn.commit()
+            except:
+                pass
 
     finally:
         cursor.close()
