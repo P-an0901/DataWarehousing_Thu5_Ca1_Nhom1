@@ -28,6 +28,7 @@ CREATE TABLE `extractlog` (
   `conf_id` int NOT NULL,
   `status` enum('info','warning','error','running','done','success') COLLATE utf8mb4_unicode_ci DEFAULT 'info',
   `message` text COLLATE utf8mb4_unicode_ci,
+  `extract_date` date NOT NULL,
   `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`log_id`)
 )

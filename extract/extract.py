@@ -40,7 +40,7 @@ def log_to_database(connection, conf_id, status="info", message="", extract_date
     try:
         cursor = connection.cursor()
         cursor.execute("""
-            INSERT INTO logs.extractLog (conf_id, status, message, created_at)
+            INSERT INTO logs.extractLog (conf_id, status, message, extract_date)
             VALUES (%s, %s, %s, %s)
         """, (conf_id, status, message[:500], extract_date))
         connection.commit()
@@ -60,7 +60,6 @@ def check_process_running(connection, conf_id, extract_date):
     exists = cursor.fetchone() is not None
     cursor.close()
     return exists
-
 
 # 3. Insert a new extractProcess row with: conf_id, status = 'running', extract_date
 def start_process(connection, conf_id, extract_date):
@@ -129,7 +128,7 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
         return False, []
 
     hotel_list = []
-    for p in properties[:5]:  # giới hạn demo
+    for p in properties[:5]:
         property_id = p.get("propertyId")
         content = p.get("content", {})
         info = content.get("informationSummary", {})
@@ -168,9 +167,9 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
     return True, hotel_list
 
 
-def save_to_json(data, conf_id, connection, prefix="review"):
+def save_to_json(data, conf_id, connection, prefix="reviews"):
     today_str = datetime.now().strftime("%d-%m-%Y")
-    folder = r"D:\Data_warehousing\extract"
+    folder = r"D:\DataWarehousing\extract"
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"{prefix}_{today_str}.json")
 
@@ -179,7 +178,6 @@ def save_to_json(data, conf_id, connection, prefix="review"):
 
     log_to_database(connection, conf_id, "success", f"Saved file: {filename}")
     return filename
-
 
 def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today()):
     config = load_config_from_xml(config_file)
@@ -233,7 +231,6 @@ def run_extraction(config_file="config.xml", conf_id=1, extract_date=date.today(
 
     finally:
         connection.close()
-
 
 
 if __name__ == "__main__":
