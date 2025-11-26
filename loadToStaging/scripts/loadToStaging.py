@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # -----------------------------
 def get_connection():
     return mysql.connector.connect(
-        host="192.168.2.7",
+        host="127.0.0.1",
         user="staging",
         password="123",
         database="Staging"
@@ -171,7 +171,7 @@ def main():
                         AND extract_date IN (
                             SELECT extract_date
                             FROM logs.extractLog
-                            WHERE status = 'SUCCESS'
+                            WHERE status = 'success'
                         )
                 )
             ORDER BY c.config_id LIMIT 1
@@ -186,7 +186,7 @@ def main():
             cursor.execute("""
                 SELECT log_id, status, extract_date
                 FROM logs.extractLog
-                WHERE extract_date = %s AND status = 'SUCCESS'
+                WHERE extract_date = %s AND status = 'success'
                 LIMIT 1
             """, (extract_date,))
             extract_log_row = cursor.fetchone()

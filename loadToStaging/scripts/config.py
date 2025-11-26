@@ -1,5 +1,5 @@
 DB_CONFIG = {
-    "host": "192.168.2.7",      # IP của server
+    "host": "127.0.0.1",      # IP của server
     "user": "staging",
     "password": "123",
     "port": 3306,

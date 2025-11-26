@@ -122,7 +122,11 @@ def extract_hotels_reviews(api_conf, conf_id, connection, limit=50):
         log_to_database(connection, conf_id, "error", f"Failed to call hotel API: {hotels_response}")
         return False, []
 
-    properties = hotels_response.get("data", {}).get("properties", [])
+    properties = (
+    hotels_response.get("data", {}).get("citySearch", {}).get("properties") or
+    hotels_response.get("data", {}).get("properties") or
+    []
+    )
     if not properties:
         log_to_database(connection, conf_id, "error", "Hotel API returned empty list")
         return False, []
